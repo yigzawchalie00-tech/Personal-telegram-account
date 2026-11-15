@@ -26,7 +26,6 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import KeyboardButtonCallback
 
 load_dotenv()
 
