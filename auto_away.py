@@ -7,18 +7,12 @@ FEATURES:
   - Away mode (toggle with .away / .back in Saved Messages)
   - Robot image sent before away text reply
   - Math calculator (any private chat)
-  - Auto-forward from specific private chats (no "Forwarded from" label)
-  - Group mirror: forward EVERYTHING from one or more groups to matching
-    targets (no "Forwarded from" label), with any leftover @channelusername
-    mention in the copied text replaced by your own target channel's
-    username (e.g. if the source channel signs its posts with
-    "@originalchannel", your mirrored copy shows "@yourchannel" instead).
-    Supports many-to-one (several sources -> one shared target) and
-    photo/video ALBUMS are reassembled and copied as a single grouped
-    album, not as separate individual posts.
+  - Auto-forward from specific private chats
+  - Group mirror: forward EVERYTHING from one group to another
   - Media auto-save
   - Daily digest
   - Offline status when away
+  - Session keepalive (get_me every 3 days to prevent session expiry)
 
 ENV VARS:
   TG_API_ID=
@@ -33,27 +27,8 @@ ENV VARS:
   MEDIA_SAVE_DIR=./saved_media
   DIGEST_ENABLED=true
   DIGEST_TIME=20:00
-
-  # Multiple mirror pairs. Both options below can be used AT THE SAME TIME
-  # -- their pairs are merged together, not one overriding the other.
-  #
-  # OPTION A — GROUP_MIRROR_PAIRS: fully flexible, mix any combination of
-  # one-to-one, many-to-one, and one-to-many in a single line.
-  # Format: source>target, comma-separated between pairs.
-  #   GROUP_MIRROR_PAIRS=@channelA>@aggregator,@channelB>@aggregator,@channelC>@channelCtarget,@channelD>@target1,@channelD>@target2
-  # Here: A and B both feed into the shared @aggregator, C has its own
-  # separate target, and D fans out to two different targets -- all at once.
-  #
-  # OPTION B — GROUP_SOURCE / GROUP_TARGET: simpler list-based config.
-  #   - Equal-length lists: paired by position (1st-to-1st, 2nd-to-2nd...)
-  #   - Single target, multiple sources: many-to-one for the WHOLE list
-  #   - Single source, multiple targets: one-to-many for the WHOLE list
-  #   GROUP_SOURCE=@channelA,@channelB,-1001234567890
-  #   GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
-  #
-  # You can set only one, or both together -- any pairs from GROUP_MIRROR_PAIRS
-  # plus any pairs from GROUP_SOURCE/GROUP_TARGET all run simultaneously.
-  # Each entry (either option) can be a group/channel username or numeric ID.
+  GROUP_SOURCE=  (group username or ID to mirror FROM)
+  GROUP_TARGET=  (group username or ID to mirror TO)
 """
 
 import os
@@ -65,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageMediaWebPage
+from telethon.tl.types import User
 from telethon.tl.functions.account import UpdateStatusRequest
 
 load_dotenv()
@@ -91,10 +66,12 @@ FORWARD_ALL_FROM_RAW = [
     x.strip() for x in os.environ.get("FORWARD_ALL_FROM", "").split(",") if x.strip()
 ]
 
+# --- Forward exclude list (never forward messages from these IDs/usernames) ---
+FORWARD_EXCLUDE_RAW = [
+    x.strip() for x in os.environ.get("FORWARD_EXCLUDE", "609517172").split(",") if x.strip()
+]
+
 # --- Group mirror config ---
-# OPTION A (flexible, mixed modes): source>target pairs, comma-separated
-GROUP_MIRROR_PAIRS = os.environ.get("GROUP_MIRROR_PAIRS", "")
-# OPTION B (simple, all-or-nothing mode): used only if GROUP_MIRROR_PAIRS is empty
 GROUP_SOURCE = os.environ.get("GROUP_SOURCE", "")
 GROUP_TARGET = os.environ.get("GROUP_TARGET", "")
 
@@ -110,145 +87,30 @@ is_away = False
 already_replied_to = set()
 forward_target_entity = None
 forward_all_from_ids = set()
-
-# List of dicts: {"source_id": <marked chat id>, "source_entity": ..., "target_entity": ...}
-mirror_pairs = []
-
-# Album buffering: Telegram delivers each photo/video in an album as a
-# SEPARATE event sharing the same grouped_id. We buffer them briefly and
-# flush as one combined album once no new part has arrived for a short
-# debounce window, rather than copying each photo as its own post.
-# Key: (source_chat_id, grouped_id) -> {"messages": [...], "pairs": [...], "timer": asyncio.Task}
-album_buffers = {}
-ALBUM_DEBOUNCE_SECONDS = 1.5
-
+forward_exclude_ids = set()   # never forward from these IDs
+group_source_id = None       # normalized "marked" chat id, matches event.chat_id
+group_target_entity = None
 daily_stats = {}
 last_digest_date = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
-# --- Copy message without "Forwarded from" label, with username swap ---
+# --- Session keepalive (prevents Telegram from expiring the session) ----------
 
-def apply_username_swap(text: str, source_entity, target_entity) -> str:
+async def session_keepalive_loop():
     """
-    Replaces any mention of the source channel's identity with the target's,
-    catching both forms people use to reference a channel:
-      - @username mentions
-      - t.me/username or https://t.me/username links (with/without www.)
-    Only runs if BOTH entities have a public username set.
+    Call get_me() every 3 days to prevent Telegram from expiring the session
+    due to "terminate inactive sessions". This is the fix for weekly disconnects.
     """
-    if not text:
-        return text
-
-    source_username = getattr(source_entity, "username", None)
-    target_username = getattr(target_entity, "username", None)
-    if not source_username or not target_username:
-        return text
-
-    at_pattern = re.compile(rf'@{re.escape(source_username)}\b', re.IGNORECASE)
-    text = at_pattern.sub(f'@{target_username}', text)
-
-    link_pattern = re.compile(
-        rf'(https?://)?(www\.)?t\.me/{re.escape(source_username)}\b',
-        re.IGNORECASE
-    )
-
-    def link_sub(m):
-        prefix = (m.group(1) or "") + (m.group(2) or "")
-        return f"{prefix}t.me/{target_username}"
-
-    text = link_pattern.sub(link_sub, text)
-    return text
-
-
-async def copy_message(target_entity, message, source_entity=None):
-    """
-    Send message content to target WITHOUT the 'Forwarded from' label.
-    Handles text, photos, documents, videos, stickers, voice notes, etc.
-
-    If source_entity and target_entity both have a @username, any mention
-    of the source's @username OR t.me/username link inside the message
-    text/caption is replaced with the target's equivalent.
-
-    IMPORTANT: this never falls back to a real forward. A real forward
-    (client.forward_messages) always carries a "Forwarded from" label,
-    which is exactly what this function exists to avoid. If a message's
-    media can't be cleanly copied (e.g. link previews, polls, contacts —
-    none of which are real uploadable files), the text is sent on its own
-    and the media is skipped, rather than leaking the original source.
-    """
-    text = message.message or ""
-    text = apply_username_swap(text, source_entity, target_entity)
-
-    media = message.media
-
-    # Link previews aren't real files -- sending the URL as plain text lets
-    # Telegram regenerate its own preview automatically on the target side.
-    if media is None or isinstance(media, MessageMediaWebPage):
-        if text:
-            await client.send_message(target_entity, text)
-        return
-
-    try:
-        await client.send_file(target_entity, file=media, caption=text or None)
-    except Exception as e:
-        print(f"[copy] Could not copy this media type ({e}); sending text only, skipping media.")
-        if text:
-            try:
-                await client.send_message(target_entity, text)
-            except Exception as e2:
-                print(f"[copy] Also failed to send text fallback: {e2}")
-
-
-async def flush_album(key):
-    """
-    Sends every buffered part of an album as ONE grouped album to each
-    matching target, instead of as separate individual posts.
-    """
-    entry = album_buffers.pop(key, None)
-    if not entry:
-        return
-
-    messages = sorted(entry["messages"], key=lambda m: m.id)
-    media_list = [m.media for m in messages if m.media]
-    if not media_list:
-        return
-
-    # Telegram albums usually carry the caption on only one of the parts.
-    caption_text = ""
-    for m in messages:
-        if m.message:
-            caption_text = m.message
-            break
-
-    for pair in entry["pairs"]:
-        target_entity = pair["target_entity"]
-        source_entity = pair["source_entity"]
-        text = apply_username_swap(caption_text, source_entity, target_entity)
-
+    INTERVAL = 3 * 24 * 60 * 60  # 3 days in seconds
+    while True:
+        await asyncio.sleep(INTERVAL)
         try:
-            await client.send_file(target_entity, file=media_list, caption=text or None)
-            print(f"[mirror] ✅ Copied album of {len(media_list)} items to target")
+            me = await client.get_me()
+            print(f"[keepalive] Session active — logged in as {me.first_name} (ID {me.id})")
         except Exception as e:
-            # If the album itself can't be sent as a group for some reason,
-            # fall back to copying each item individually (still unlabeled,
-            # never a real forward) rather than losing the content.
-            print(f"[mirror] ⚠️ Album copy failed ({e}); sending items individually instead.")
-            for m in messages:
-                try:
-                    await copy_message(target_entity, m, source_entity=source_entity)
-                except Exception as e2:
-                    print(f"[mirror] ❌ Individual fallback failed: {e2}")
-
-
-async def schedule_album_flush(key):
-    """Debounce timer: flush only after no new part has arrived for a bit."""
-    try:
-        await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
-        await flush_album(key)
-    except asyncio.CancelledError:
-        pass  # a newer part arrived and reset the timer -- this one is stale
+            print(f"[keepalive] get_me() failed: {e}")
 
 
 # --- Offline-status control ---
@@ -268,67 +130,128 @@ async def offline_keepalive_loop():
         await asyncio.sleep(30)
 
 
-# --- Math calculator ---
+# --- Math calculator (scientific, full order of operations) ---
+
+import math as _math
+
+# Safe names allowed inside eval
+_SAFE_GLOBALS = {
+    "__builtins__": {},
+    "abs": abs, "round": round, "pow": pow,
+    "sqrt": _math.sqrt, "log": _math.log, "log10": _math.log10,
+    "log2": _math.log2, "sin": _math.sin, "cos": _math.cos,
+    "tan": _math.tan, "asin": _math.asin, "acos": _math.acos,
+    "atan": _math.atan, "atan2": _math.atan2,
+    "floor": _math.floor, "ceil": _math.ceil,
+    "pi": _math.pi, "e": _math.e,
+    "factorial": _math.factorial,
+}
+
+
+def _clean_expr(expr: str) -> str:
+    """Normalise an expression string so Python eval can handle it."""
+    expr = expr.strip()
+    # Remove thousands-separating commas (e.g. 1,000 → 1000)
+    expr = re.sub(r'(\d),(\d)', r'\1\2', expr)
+    # Replace common alternate symbols
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    # Replace 'x' used as multiply only when surrounded by digits/spaces
+    expr = re.sub(r'(?<=[\d\s])[xX](?=[\d\s])', '*', expr)
+    return expr
+
+
+def _safe_eval(expr: str):
+    """Evaluate a mathematical expression safely. Returns (result, error_str)."""
+    try:
+        result = eval(expr, _SAFE_GLOBALS, {})   # noqa: S307
+        return result, None
+    except ZeroDivisionError:
+        return None, "Division by zero"
+    except Exception as e:
+        return None, str(e)
+
+
+def _fmt(value) -> str:
+    """Format a number nicely — no trailing .0 for integers."""
+    if isinstance(value, float) and value.is_integer():
+        return f"{int(value):,}"
+    if isinstance(value, float):
+        # Up to 10 significant digits, strip trailing zeros
+        s = f"{value:.10g}"
+        return s
+    return f"{value:,}"
+
 
 def parse_and_calculate(text: str):
+    """
+    Scientific calculator.
+
+    Handles:
+      • Full order-of-operations:  3+6*5+9  →  42
+      • Multi-line with per-line results + grand total
+      • Optional label prefix:  "Apples = 3*5"
+      • Functions: sqrt(), sin(), log(), factorial(), …
+      • Constants: pi, e
+      • Exponent: 2^10 or 2**10
+      • Percent: 200*15% → 30  (% converted to /100)
+    """
     lines = text.strip().splitlines()
     results = []
-    grand_total = 0
+    grand_total = 0.0
     found_any = False
 
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for raw_line in lines:
+        raw_line = raw_line.strip()
+        if not raw_line:
             continue
 
-        match = re.match(
-            r'^(.*?)=?\s*(\d[\d,]*)\s*[\*x×]\s*(\d[\d,]*)\s*$',
-            line, re.IGNORECASE
-        )
-        if match:
-            label = match.group(1).strip().rstrip("=").strip()
-            num1 = int(match.group(2).replace(",", ""))
-            num2 = int(match.group(3).replace(",", ""))
-            result = num1 * num2
-            grand_total += result
-            found_any = True
-            if label:
-                results.append(f"{label} = {num1:,} * {num2:,} = {result:,}")
-            else:
-                results.append(f"{num1:,} * {num2:,} = {result:,}")
+        # Try to split "Label = expression" or just "expression"
+        label = ""
+        expr_part = raw_line
+        label_match = re.match(r'^([^=\d(]+?)\s*=\s*(.+)$', raw_line)
+        if label_match:
+            possible_label = label_match.group(1).strip()
+            possible_expr = label_match.group(2).strip()
+            # Only treat as label if the left side has no digits (avoid "3+2 = ?" style)
+            if not re.search(r'\d', possible_label):
+                label = possible_label
+                expr_part = possible_expr
+
+        # Normalise percent signs before cleaning  e.g. 15% → 0.15
+        expr_part = re.sub(r'(\d+(?:\.\d+)?)\s*%', lambda m: str(float(m.group(1)) / 100), expr_part)
+
+        clean = _clean_expr(expr_part)
+
+        # Only try eval if the expression contains a digit or known constant
+        if not re.search(r'[\d]|pi|e\b', clean):
+            results.append(raw_line)
+            continue
+
+        value, err = _safe_eval(clean)
+        if err is not None or value is None:
+            results.append(raw_line)
+            continue
+
+        found_any = True
+        try:
+            grand_total += float(value)
+        except (TypeError, ValueError):
+            pass
+
+        fmt_val = _fmt(value)
+        if label:
+            results.append(f"{label} = {expr_part} = {fmt_val}")
         else:
-            plain_match = re.match(
-                r'^(.*?)=?\s*(\d[\d,]*)\s*([+\-÷/])\s*(\d[\d,]*)\s*$', line
-            )
-            if plain_match:
-                label = plain_match.group(1).strip().rstrip("=").strip()
-                num1 = int(plain_match.group(2).replace(",", ""))
-                op = plain_match.group(3)
-                num2 = int(plain_match.group(4).replace(",", ""))
-                if op == "+":
-                    result = num1 + num2
-                    op_display = "+"
-                elif op == "-":
-                    result = num1 - num2
-                    op_display = "-"
-                elif op in ["÷", "/"]:
-                    result = round(num1 / num2, 2) if num2 != 0 else 0
-                    op_display = "÷"
-                else:
-                    continue
-                grand_total += result
-                found_any = True
-                if label:
-                    results.append(f"{label} = {num1:,} {op_display} {num2:,} = {result:,}")
-                else:
-                    results.append(f"{num1:,} {op_display} {num2:,} = {result:,}")
-            else:
-                results.append(line)
+            results.append(f"{expr_part} = {fmt_val}")
 
     if not found_any:
         return None
-    results.append("")
-    results.append(f"Total = {grand_total:,}")
+
+    if len([r for r in results if "=" in r]) > 1:
+        # Only show grand total when there are multiple calculations
+        results.append("")
+        results.append(f"Total = {_fmt(grand_total)}")
+
     return "\n".join(results)
 
 
@@ -361,6 +284,11 @@ def safe_filename_part(name: str) -> str:
 # --- Resolve helpers ---
 
 async def resolve_from_dialogs(target_id: int):
+    """
+    Search dialogs for a match by either the bare entity id OR the
+    normalized 'marked' peer id (the form Telethon uses for event.chat_id,
+    e.g. -100xxxxxxxxxx for supergroups/channels).
+    """
     try:
         async for dialog in client.iter_dialogs():
             if dialog.entity.id == target_id or utils.get_peer_id(dialog.entity) == target_id:
@@ -371,6 +299,9 @@ async def resolve_from_dialogs(target_id: int):
 
 
 async def resolve_any_chat(value: str):
+    """
+    Resolve a username or numeric ID (bare or marked/-100 form) to an entity.
+    """
     value = value.strip()
     if not value:
         raise ValueError("empty value")
@@ -430,92 +361,42 @@ async def resolve_forward_all_from():
     print(f"[forward] Active IDs: {forward_all_from_ids}")
 
 
-async def resolve_group_mirrors():
-    """
-    Resolves group mirror config into `mirror_pairs`. BOTH config styles can
-    be used at once -- their results are merged, not one overriding the
-    other:
-
-    - GROUP_MIRROR_PAIRS: source>target pairs, comma-separated. Supports any
-      mix of one-to-one, many-to-one, and one-to-many, since each pair is
-      independent.
-    - GROUP_SOURCE / GROUP_TARGET: simpler list-based config --
-        - Equal-length lists: paired by position (1st source -> 1st target)
-        - Single target, multiple sources: many-to-one for the whole list
-        - Single source, multiple targets: one-to-many for the whole list
-
-    Any pairs from both are added together into the same mirror_pairs list.
-
-    Each pair's source_id is the normalized 'marked' peer id so it can be
-    compared directly against event.chat_id.
-    """
-    global mirror_pairs
-
-    # Cache resolved entities across BOTH config styles so a repeated
-    # source/target isn't re-resolved every time.
-    resolved_cache = {}
-
-    async def resolve_cached(value):
-        if value not in resolved_cache:
-            resolved_cache[value] = await resolve_any_chat(value)
-        return resolved_cache[value]
-
-    async def add_pair(src_val, tgt_val):
+async def resolve_forward_exclude():
+    global forward_exclude_ids
+    for entry in FORWARD_EXCLUDE_RAW:
         try:
-            source_entity = await resolve_cached(src_val)
-            source_id = utils.get_peer_id(source_entity)
+            if entry.lstrip("-").isdigit():
+                forward_exclude_ids.add(int(entry))
+                print(f"[forward] 🚫 Excluded ID: {entry}")
+            else:
+                entity = await client.get_entity(entry)
+                forward_exclude_ids.add(entity.id)
+                print(f"[forward] 🚫 Excluded: {entry} → ID {entity.id}")
         except Exception as e:
-            print(f"[mirror] ❌ Could not resolve source '{src_val}': {e}")
-            return
-        try:
-            target_entity = await resolve_cached(tgt_val)
-        except Exception as e:
-            print(f"[mirror] ❌ Could not resolve target '{tgt_val}': {e}")
-            return
+            print(f"[forward] ❌ Could not resolve exclude '{entry}': {e}")
 
-        mirror_pairs.append({
-            "source_id": source_id,
-            "source_entity": source_entity,
-            "target_entity": target_entity,
-        })
-        print(
-            f"[mirror] ✅ {getattr(source_entity, 'title', src_val)} → "
-            f"{getattr(target_entity, 'title', tgt_val)} (chat_id {source_id})"
-        )
 
-    # --- GROUP_MIRROR_PAIRS (if set) ---
-    if GROUP_MIRROR_PAIRS.strip():
-        raw_pairs = [p.strip() for p in GROUP_MIRROR_PAIRS.split(",") if p.strip()]
-        print(f"[mirror] GROUP_MIRROR_PAIRS: {len(raw_pairs)} pair(s) configured.")
-        for raw in raw_pairs:
-            if ">" not in raw:
-                print(f"[mirror] ❌ Malformed pair '{raw}' — expected format source>target, skipping.")
-                continue
-            src_val, tgt_val = (part.strip() for part in raw.split(">", 1))
-            await add_pair(src_val, tgt_val)
-
-    # --- GROUP_SOURCE / GROUP_TARGET (if set) -- merged in alongside the above ---
-    sources = [s.strip() for s in GROUP_SOURCE.split(",") if s.strip()]
-    targets = [t.strip() for t in GROUP_TARGET.split(",") if t.strip()]
-
-    if sources and targets:
-        if len(targets) == 1 and len(sources) > 1:
-            print(f"[mirror] GROUP_SOURCE/TARGET many-to-one: all {len(sources)} sources -> '{targets[0]}'.")
-            targets = targets * len(sources)
-        elif len(sources) == 1 and len(targets) > 1:
-            print(f"[mirror] GROUP_SOURCE/TARGET one-to-many: '{sources[0]}' -> all {len(targets)} targets.")
-            sources = sources * len(targets)
-        elif len(sources) != len(targets):
-            print(
-                f"[mirror] ⚠️ GROUP_SOURCE has {len(sources)} entries but GROUP_TARGET has "
-                f"{len(targets)}. Pairing by position up to the shorter list; extra entries ignored."
-            )
-
-        for src_val, tgt_val in zip(sources, targets):
-            await add_pair(src_val, tgt_val)
-
-    if not mirror_pairs:
-        print("[mirror] No valid mirror pairs configured (GROUP_MIRROR_PAIRS and GROUP_SOURCE/GROUP_TARGET both empty or invalid).")
+async def resolve_group_mirror():
+    """
+    Resolves GROUP_SOURCE / GROUP_TARGET. Stores group_source_id as the
+    normalized 'marked' peer id for direct comparison against event.chat_id.
+    """
+    global group_source_id, group_target_entity
+    if not GROUP_SOURCE or not GROUP_TARGET:
+        print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
+        return
+    try:
+        source_entity = await resolve_any_chat(GROUP_SOURCE)
+        group_source_id = utils.get_peer_id(source_entity)
+        print(f"[mirror] ✅ Source: {getattr(source_entity, 'title', GROUP_SOURCE)} → chat_id {group_source_id}")
+    except Exception as e:
+        print(f"[mirror] ❌ Could not resolve GROUP_SOURCE: {e}")
+        return
+    try:
+        group_target_entity = await resolve_any_chat(GROUP_TARGET)
+        print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
+    except Exception as e:
+        print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {e}")
 
 
 # --- Handlers ---
@@ -542,36 +423,15 @@ async def toggle_handler(event):
 async def message_handler(event):
     """Handle ALL incoming messages — private and group."""
 
-    # ── GROUP MIRROR (supports many-to-one, one-to-many, and albums) ───────
+    # ── GROUP MIRROR ──────────────────────────────────────────────────────
     if not event.is_private:
-        chat_id = event.chat_id
-        matching_pairs = [p for p in mirror_pairs if p["source_id"] == chat_id]
-        if not matching_pairs:
-            return
-
-        grouped_id = getattr(event.message, "grouped_id", None)
-
-        if grouped_id:
-            # Part of an album -- buffer it and (re)start the debounce timer
-            key = (chat_id, grouped_id)
-            if key not in album_buffers:
-                album_buffers[key] = {"messages": [], "pairs": matching_pairs, "timer": None}
-            album_buffers[key]["messages"].append(event.message)
-
-            old_timer = album_buffers[key].get("timer")
-            if old_timer:
-                old_timer.cancel()
-            album_buffers[key]["timer"] = asyncio.create_task(schedule_album_flush(key))
-            return
-
-        for pair in matching_pairs:
-            try:
-                await copy_message(
-                    pair["target_entity"], event.message, source_entity=pair["source_entity"]
-                )
-                print(f"[mirror] ✅ Copied message from chat_id {chat_id} to target")
-            except Exception as e:
-                print(f"[mirror] ❌ Failed: {e}")
+        if group_source_id and group_target_entity:
+            if event.chat_id == group_source_id:
+                try:
+                    await client.forward_messages(group_target_entity, event.message)
+                    print(f"[mirror] ✅ Forwarded group message to target")
+                except Exception as e:
+                    print(f"[mirror] ❌ Failed: {e}")
         return
 
     # ── PRIVATE CHAT ──────────────────────────────────────────────────────
@@ -602,9 +462,9 @@ async def message_handler(event):
         except Exception as e:
             print(f"[media] Failed to save media from {name}: {e}")
 
-    # Auto-forward (no source label)
+    # Auto-forward
     should_forward = False
-    if forward_target_entity is not None:
+    if forward_target_entity is not None and sender_id not in forward_exclude_ids:
         if forward_all_from_ids and sender_id in forward_all_from_ids:
             should_forward = True
             print(f"[forward] Matched FORWARD_ALL_FROM: {name}")
@@ -613,11 +473,13 @@ async def message_handler(event):
         elif FORWARD_KEYWORDS and message_text:
             if any(kw in message_text.lower() for kw in FORWARD_KEYWORDS):
                 should_forward = True
+    elif sender_id in forward_exclude_ids:
+        print(f"[forward] Skipped (excluded): {name}")
 
     if should_forward:
         try:
-            await copy_message(forward_target_entity, event.message)
-            print(f"[forward] ✅ Copied from {name} (no source label)")
+            await client.forward_messages(forward_target_entity, event.message)
+            print(f"[forward] ✅ Forwarded from {name}")
         except Exception as e:
             print(f"[forward] ❌ Failed: {e}")
 
@@ -700,10 +562,7 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         status = "AWAY" if is_away else "ACTIVE"
         fwd_ids = ",".join(str(i) for i in forward_all_from_ids) or "none"
-        mirror = (
-            ", ".join(f"{p['source_id']}→{getattr(p['target_entity'], 'id', '?')}" for p in mirror_pairs)
-            or "disabled"
-        )
+        mirror = f"{group_source_id}→{getattr(group_target_entity,'id','?')}" if group_source_id else "disabled"
         self.wfile.write(
             f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror}".encode()
         )
@@ -735,12 +594,15 @@ async def main():
 
     await resolve_forward_target()
     await resolve_forward_all_from()
-    await resolve_group_mirrors()
+    await resolve_forward_exclude()
+    await resolve_group_mirror()
 
     if is_away:
         await set_telegram_offline(True)
 
     asyncio.create_task(offline_keepalive_loop())
+    asyncio.create_task(session_keepalive_loop())   # <-- prevents session expiry
+
     if DIGEST_ENABLED:
         asyncio.create_task(digest_loop())
 
