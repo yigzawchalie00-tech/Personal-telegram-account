@@ -29,7 +29,7 @@ ENV VARS:
   MEDIA_SAVE_DIR=./saved_media
   DIGEST_ENABLED=true
   DIGEST_TIME=20:00
-  GROUP_SOURCE=  (group username or ID to mirror FROM)
+  GROUP_SOURCE=  (comma-separated group usernames or IDs to mirror FROM)
   GROUP_TARGET=  (group username or ID to mirror TO)
 
   --- YouTube bridge (leave YT_SCHEDULER_BOT empty to disable) ---
@@ -41,6 +41,7 @@ ENV VARS:
 
 import os
 import re
+import math as _math
 import asyncio
 import threading
 from datetime import datetime, date
@@ -80,7 +81,10 @@ FORWARD_EXCLUDE_RAW = [
 ]
 
 # --- Group mirror config ---
-GROUP_SOURCE = os.environ.get("GROUP_SOURCE", "")
+# GROUP_SOURCE supports multiple comma-separated channels: @chan1,@chan2,123456
+GROUP_SOURCE_RAW = [
+    x.strip() for x in os.environ.get("GROUP_SOURCE", "").split(",") if x.strip()
+]
 GROUP_TARGET = os.environ.get("GROUP_TARGET", "")
 
 # --- Media organizer config ---
@@ -103,7 +107,7 @@ already_replied_to = set()
 forward_target_entity = None
 forward_all_from_ids = set()
 forward_exclude_ids = set()   # never forward from these IDs
-group_source_id = None       # normalized "marked" chat id, matches event.chat_id
+group_source_ids = set()      # normalized marked chat ids for ALL source channels
 group_target_entity = None
 daily_stats = {}
 last_digest_date = None
@@ -150,8 +154,6 @@ async def offline_keepalive_loop():
 
 
 # --- Math calculator (scientific, full order of operations) ---
-
-import math as _math
 
 # Safe names allowed inside eval
 _SAFE_GLOBALS = {
@@ -397,20 +399,31 @@ async def resolve_forward_exclude():
 
 async def resolve_group_mirror():
     """
-    Resolves GROUP_SOURCE / GROUP_TARGET. Stores group_source_id as the
-    normalized 'marked' peer id for direct comparison against event.chat_id.
+    Resolves all GROUP_SOURCE entries (comma-separated) and GROUP_TARGET.
+    group_source_ids holds the normalized 'marked' peer ids for direct
+    comparison against event.chat_id.
     """
-    global group_source_id, group_target_entity
-    if not GROUP_SOURCE or not GROUP_TARGET:
+    global group_source_ids, group_target_entity
+
+    if not GROUP_SOURCE_RAW or not GROUP_TARGET:
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
-    try:
-        source_entity = await resolve_any_chat(GROUP_SOURCE)
-        group_source_id = utils.get_peer_id(source_entity)
-        print(f"[mirror] ✅ Source: {getattr(source_entity, 'title', GROUP_SOURCE)} → chat_id {group_source_id}")
-    except Exception as e:
-        print(f"[mirror] ❌ Could not resolve GROUP_SOURCE: {e}")
+
+    print(f"[mirror] Resolving {len(GROUP_SOURCE_RAW)} source channel(s)...")
+    for entry in GROUP_SOURCE_RAW:
+        try:
+            source_entity = await resolve_any_chat(entry)
+            marked_id = utils.get_peer_id(source_entity)
+            group_source_ids.add(marked_id)
+            title = getattr(source_entity, 'title', entry)
+            print(f"[mirror] ✅ Source: {title} → chat_id {marked_id}")
+        except Exception as e:
+            print(f"[mirror] ❌ Could not resolve source '{entry}': {e}")
+
+    if not group_source_ids:
+        print("[mirror] ❌ No sources resolved — mirror disabled.")
         return
+
     try:
         group_target_entity = await resolve_any_chat(GROUP_TARGET)
         print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
@@ -444,11 +457,11 @@ async def message_handler(event):
 
     # ── GROUP MIRROR ──────────────────────────────────────────────────────
     if not event.is_private:
-        if group_source_id and group_target_entity:
-            if event.chat_id == group_source_id:
+        if group_source_ids and group_target_entity:
+            if event.chat_id in group_source_ids:
                 try:
                     await client.forward_messages(group_target_entity, event.message)
-                    print(f"[mirror] ✅ Forwarded group message to target")
+                    print(f"[mirror] ✅ Forwarded from chat_id {event.chat_id} to target")
                 except Exception as e:
                     print(f"[mirror] ❌ Failed: {e}")
         return
@@ -672,7 +685,11 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         status = "AWAY" if is_away else "ACTIVE"
         fwd_ids = ",".join(str(i) for i in forward_all_from_ids) or "none"
-        mirror = f"{group_source_id}→{getattr(group_target_entity,'id','?')}" if group_source_id else "disabled"
+        if group_source_ids and group_target_entity:
+            src_list = ",".join(str(i) for i in group_source_ids)
+            mirror = f"{src_list}→{getattr(group_target_entity, 'id', '?')}"
+        else:
+            mirror = "disabled"
         bridge = "on" if BRIDGE_ENABLED else "off"
         self.wfile.write(
             f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror} - bridge: {bridge}".encode()
