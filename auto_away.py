@@ -87,6 +87,12 @@ GROUP_SOURCE_RAW = [
 ]
 GROUP_TARGET = os.environ.get("GROUP_TARGET", "")
 
+# GROUP_MIRROR_PAIRS: comma-separated @source>@target pairs
+# e.g. @chan1>@dest1,@chan2>@dest2
+GROUP_MIRROR_PAIRS_RAW = [
+    x.strip() for x in os.environ.get("GROUP_MIRROR_PAIRS", "").split(",") if x.strip()
+]
+
 # --- Media organizer config ---
 MEDIA_SAVE_DIR = os.environ.get("MEDIA_SAVE_DIR", "./saved_media")
 
@@ -109,6 +115,7 @@ forward_all_from_ids = set()
 forward_exclude_ids = set()   # never forward from these IDs
 group_source_ids = set()      # normalized marked chat ids for ALL source channels
 group_target_entity = None
+mirror_pairs = {}             # {source_chat_id: target_entity} from GROUP_MIRROR_PAIRS
 daily_stats = {}
 last_digest_date = None
 
@@ -436,6 +443,41 @@ async def resolve_group_mirror():
         print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {type(e).__name__}: {e}")
 
 
+async def resolve_mirror_pairs():
+    """
+    Resolves GROUP_MIRROR_PAIRS entries like @source>@target
+    into {source_chat_id: target_entity} stored in mirror_pairs.
+    """
+    global mirror_pairs
+    if not GROUP_MIRROR_PAIRS_RAW:
+        print("[pairs] No GROUP_MIRROR_PAIRS set.")
+        return
+    print(f"[pairs] Resolving {len(GROUP_MIRROR_PAIRS_RAW)} mirror pair(s)...")
+    for pair in GROUP_MIRROR_PAIRS_RAW:
+        if ">" not in pair:
+            print(f"[pairs] ❌ Invalid pair (no '>'): {pair!r}")
+            continue
+        src_raw, _, tgt_raw = pair.partition(">")
+        src_raw = src_raw.strip()
+        tgt_raw = tgt_raw.strip()
+        try:
+            src_entity = await resolve_any_chat(src_raw)
+            src_id = utils.get_peer_id(src_entity)
+        except Exception as e:
+            print(f"[pairs] ❌ Could not resolve source '{src_raw}': {e}")
+            continue
+        try:
+            tgt_entity = await resolve_any_chat(tgt_raw)
+        except Exception as e:
+            print(f"[pairs] ❌ Could not resolve target '{tgt_raw}': {e}")
+            continue
+        mirror_pairs[src_id] = tgt_entity
+        src_title = getattr(src_entity, 'title', src_raw)
+        tgt_title = getattr(tgt_entity, 'title', tgt_raw)
+        print(f"[pairs] ✅ {src_title} → {tgt_title} (src_id={src_id})")
+    print(f"[pairs] Active pairs: {len(mirror_pairs)}")
+
+
 # --- Handlers ---
 
 @client.on(events.NewMessage(outgoing=True, chats="me"))
@@ -462,6 +504,7 @@ async def message_handler(event):
 
     # ── GROUP MIRROR ──────────────────────────────────────────────────────
     if not event.is_private:
+        # Simple GROUP_SOURCE → GROUP_TARGET mirror
         if group_source_ids and group_target_entity:
             if event.chat_id in group_source_ids:
                 try:
@@ -469,6 +512,15 @@ async def message_handler(event):
                     print(f"[mirror] ✅ Forwarded from chat_id {event.chat_id} to target")
                 except Exception as e:
                     print(f"[mirror] ❌ Failed: {e}")
+
+        # GROUP_MIRROR_PAIRS: @source>@target pairs
+        if event.chat_id in mirror_pairs:
+            try:
+                await client.forward_messages(mirror_pairs[event.chat_id], event.message)
+                print(f"[pairs] ✅ Forwarded from chat_id {event.chat_id}")
+            except Exception as e:
+                print(f"[pairs] ❌ Failed: {e}")
+
         return
 
     # ── PRIVATE CHAT ──────────────────────────────────────────────────────
@@ -695,9 +747,10 @@ class PingHandler(BaseHTTPRequestHandler):
             mirror = f"{src_list}→{getattr(group_target_entity, 'id', '?')}"
         else:
             mirror = "disabled"
+        pairs = f"{len(mirror_pairs)} pairs" if mirror_pairs else "disabled"
         bridge = "on" if BRIDGE_ENABLED else "off"
         self.wfile.write(
-            f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror} - bridge: {bridge}".encode()
+            f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror} - pairs: {pairs} - bridge: {bridge}".encode()
         )
 
     def log_message(self, format, *args):
@@ -730,6 +783,7 @@ async def main():
     await resolve_forward_all_from()
     await resolve_forward_exclude()
     await resolve_group_mirror()
+    await resolve_mirror_pairs()
 
     if is_away:
         await set_telegram_offline(True)
