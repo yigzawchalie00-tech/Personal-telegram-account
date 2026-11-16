@@ -405,6 +405,9 @@ async def resolve_group_mirror():
     """
     global group_source_ids, group_target_entity
 
+    print(f"[mirror] GROUP_SOURCE_RAW = {GROUP_SOURCE_RAW}")
+    print(f"[mirror] GROUP_TARGET = {GROUP_TARGET!r}")
+
     if not GROUP_SOURCE_RAW or not GROUP_TARGET:
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
@@ -412,23 +415,25 @@ async def resolve_group_mirror():
     print(f"[mirror] Resolving {len(GROUP_SOURCE_RAW)} source channel(s)...")
     for entry in GROUP_SOURCE_RAW:
         try:
+            print(f"[mirror] Trying to resolve '{entry}'...")
             source_entity = await resolve_any_chat(entry)
             marked_id = utils.get_peer_id(source_entity)
             group_source_ids.add(marked_id)
             title = getattr(source_entity, 'title', entry)
             print(f"[mirror] ✅ Source: {title} → chat_id {marked_id}")
         except Exception as e:
-            print(f"[mirror] ❌ Could not resolve source '{entry}': {e}")
+            print(f"[mirror] ❌ Could not resolve source '{entry}': {type(e).__name__}: {e}")
 
     if not group_source_ids:
         print("[mirror] ❌ No sources resolved — mirror disabled.")
         return
 
     try:
+        print(f"[mirror] Trying to resolve target '{GROUP_TARGET}'...")
         group_target_entity = await resolve_any_chat(GROUP_TARGET)
         print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
     except Exception as e:
-        print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {e}")
+        print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {type(e).__name__}: {e}")
 
 
 # --- Handlers ---
