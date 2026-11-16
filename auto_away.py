@@ -1,5 +1,5 @@
 """
-Telegram Personal-Account Auto-Away Responder + Math Calculator
+Telegram Personal-Account Auto-Away Responder + Math Calculator + YouTube Bridge
 -----------------------------------------------
 Logs in as YOUR Telegram account (not a bot) using Telethon.
 
@@ -13,6 +13,8 @@ FEATURES:
   - Daily digest
   - Offline status when away
   - Session keepalive (get_me every 3 days to prevent session expiry)
+  - YouTube downloader bridge (built in, same client/session):
+      scheduler bot -> "DOWNLOAD:<url>[|<row_id>]" -> @Gozilla_bot -> video back
 
 ENV VARS:
   TG_API_ID=
@@ -29,6 +31,12 @@ ENV VARS:
   DIGEST_TIME=20:00
   GROUP_SOURCE=  (group username or ID to mirror FROM)
   GROUP_TARGET=  (group username or ID to mirror TO)
+
+  --- YouTube bridge (leave YT_SCHEDULER_BOT empty to disable) ---
+  YT_SCHEDULER_BOT=   your scheduler bot username e.g. @MyYTSchedulerBot
+  DOWNLOADER_BOT=     default Gozilla_bot
+  QUALITY=            default 854p
+  JOB_TIMEOUT=        seconds to wait per download (default 300)
 """
 
 import os
@@ -82,6 +90,13 @@ MEDIA_SAVE_DIR = os.environ.get("MEDIA_SAVE_DIR", "./saved_media")
 DIGEST_ENABLED = os.environ.get("DIGEST_ENABLED", "false").lower() == "true"
 DIGEST_TIME = os.environ.get("DIGEST_TIME", "20:00")
 
+# --- YouTube bridge config ---
+YT_SCHEDULER_BOT = os.environ.get("YT_SCHEDULER_BOT", "").strip().lstrip("@")
+DOWNLOADER_BOT = os.environ.get("DOWNLOADER_BOT", "Gozilla_bot").strip().lstrip("@")
+QUALITY = os.environ.get("QUALITY", "854p")
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "300"))
+BRIDGE_ENABLED = bool(YT_SCHEDULER_BOT)
+
 # In-memory state
 is_away = False
 already_replied_to = set()
@@ -92,6 +107,10 @@ group_source_id = None       # normalized "marked" chat id, matches event.chat_i
 group_target_entity = None
 daily_stats = {}
 last_digest_date = None
+
+# Bridge state: one download at a time so Gozilla replies can't get mixed up
+bridge_jobs = None  # created in main() once the event loop is running
+bridge_current = {"job": None, "done": None, "clicked": set()}
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -436,6 +455,8 @@ async def message_handler(event):
 
     # ── PRIVATE CHAT ──────────────────────────────────────────────────────
     sender = await event.get_sender()
+    # Bots (including the scheduler bot and Gozilla) are handled by the
+    # bridge handlers below, never by the away/calculator logic.
     if sender is None or getattr(sender, "bot", False):
         return
 
@@ -510,6 +531,95 @@ async def message_handler(event):
     print(f"[auto-reply] Sent image + away message to {name}")
 
 
+# --- YouTube downloader bridge (runs on the same client as everything above) ---
+
+async def bridge_worker():
+    """Process download jobs one at a time so Gozilla replies can't get mixed up."""
+    while True:
+        url, row_id = await bridge_jobs.get()
+        done = asyncio.Event()
+        bridge_current.update(job=(url, row_id), done=done, clicked=set())
+        try:
+            print(f"[bridge] Sending to @{DOWNLOADER_BOT}: {url} (row={row_id})")
+            await client.send_message(DOWNLOADER_BOT, url)
+            await asyncio.wait_for(done.wait(), JOB_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"[bridge] ❌ Timed out waiting for video: {url}")
+        except Exception as e:
+            print(f"[bridge] ❌ Job failed: {e}")
+        finally:
+            bridge_current.update(job=None, done=None)
+
+
+async def bridge_click_quality(msg):
+    if msg.id in bridge_current["clicked"]:
+        return
+    buttons = [b for row in msg.buttons for b in row]
+    choice = next((b for b in buttons if QUALITY.lower() in (b.text or "").lower()), None)
+    if choice is None:
+        choice = next(
+            (b for b in buttons if "p -" in (b.text or "") or "MB" in (b.text or "")), None
+        )
+    if choice:
+        bridge_current["clicked"].add(msg.id)
+        print(f"[bridge] Clicking: {choice.text}")
+        await choice.click()
+
+
+async def bridge_gozilla_handler(event):
+    """Gozilla replies: click the quality button, then pass the video on."""
+    msg = event.message
+    job = bridge_current["job"]
+    if not job:
+        return  # not expecting anything
+
+    if msg.buttons:
+        await bridge_click_quality(msg)
+        return
+
+    if msg.video or msg.document:
+        url, row_id = job
+        try:
+            scheduler = await client.get_entity(YT_SCHEDULER_BOT)
+            if row_id:
+                # Auto-repost: re-send with ROW:<id> caption so the bot can match it
+                await client.send_file(scheduler, msg.media, caption=f"ROW:{row_id}")
+            else:
+                # Manual flow: plain forward
+                await client.forward_messages(scheduler, msg)
+            print(f"[bridge] ✅ Video sent to @{YT_SCHEDULER_BOT} (row={row_id})")
+        except Exception as e:
+            print(f"[bridge] ❌ Failed to send video: {e}")
+        finally:
+            if bridge_current["done"]:
+                bridge_current["done"].set()
+
+
+async def bridge_scheduler_handler(event):
+    """Download requests from the scheduler bot: DOWNLOAD:<url>[|<row_id>]."""
+    text = (event.message.text or "").strip()
+    if not text.startswith("DOWNLOAD:"):
+        return
+    payload = text[len("DOWNLOAD:"):].strip()
+    url, _, row = payload.partition("|")
+    row_id = int(row) if row.strip().isdigit() else None
+    print(f"[bridge] Queued: {url.strip()} (row={row_id})")
+    await bridge_jobs.put((url.strip(), row_id))
+
+
+def register_bridge_handlers():
+    client.add_event_handler(
+        bridge_gozilla_handler, events.NewMessage(from_users=DOWNLOADER_BOT)
+    )
+    client.add_event_handler(
+        bridge_gozilla_handler, events.MessageEdited(from_users=DOWNLOADER_BOT)
+    )
+    client.add_event_handler(
+        bridge_scheduler_handler, events.NewMessage(from_users=YT_SCHEDULER_BOT)
+    )
+    print(f"[bridge] ✅ Enabled: @{YT_SCHEDULER_BOT} ⇄ @{DOWNLOADER_BOT} (quality {QUALITY})")
+
+
 # --- Daily digest ---
 
 async def digest_loop():
@@ -563,8 +673,9 @@ class PingHandler(BaseHTTPRequestHandler):
         status = "AWAY" if is_away else "ACTIVE"
         fwd_ids = ",".join(str(i) for i in forward_all_from_ids) or "none"
         mirror = f"{group_source_id}→{getattr(group_target_entity,'id','?')}" if group_source_id else "disabled"
+        bridge = "on" if BRIDGE_ENABLED else "off"
         self.wfile.write(
-            f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror}".encode()
+            f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror} - bridge: {bridge}".encode()
         )
 
     def log_message(self, format, *args):
@@ -581,6 +692,7 @@ def start_ping_server():
 # --- Main ---
 
 async def main():
+    global bridge_jobs
     threading.Thread(target=start_ping_server, daemon=True).start()
     print("Logging in...")
     await client.start()
@@ -602,6 +714,13 @@ async def main():
 
     asyncio.create_task(offline_keepalive_loop())
     asyncio.create_task(session_keepalive_loop())   # <-- prevents session expiry
+
+    if BRIDGE_ENABLED:
+        bridge_jobs = asyncio.Queue()
+        register_bridge_handlers()
+        asyncio.create_task(bridge_worker())
+    else:
+        print("[bridge] YT_SCHEDULER_BOT not set — bridge disabled.")
 
     if DIGEST_ENABLED:
         asyncio.create_task(digest_loop())
