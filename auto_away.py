@@ -478,6 +478,52 @@ async def resolve_mirror_pairs():
     print(f"[pairs] Active pairs: {len(mirror_pairs)}")
 
 
+# --- Mirror copy helper ---
+
+def _strip_links(text: str) -> str:
+    """Remove all URLs and t.me links from text."""
+    if not text:
+        return text
+    # Remove URLs (http/https)
+    text = re.sub(r'https?://\S+', '', text)
+    # Remove bare t.me links
+    text = re.sub(r't\.me/\S+', '', text)
+    # Remove @username mentions that are links
+    # Clean up extra whitespace/newlines left behind
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+async def mirror_copy(message, target):
+    """
+    Re-send a message as our own (not forwarded).
+    - Strips all links from text/caption
+    - Re-sends media with cleaned caption
+    - Text-only messages sent as plain text
+    """
+    try:
+        raw_text = message.text or message.message or ""
+        clean_text = _strip_links(raw_text)
+
+        if message.media:
+            # Download and re-send media with cleaned caption
+            media = await client.download_media(message, file=bytes)
+            await client.send_file(
+                target,
+                file=media,
+                caption=clean_text or None,
+                force_document=False,
+            )
+            print(f"[mirror] ✅ Re-sent media to target")
+        elif clean_text:
+            await client.send_message(target, clean_text)
+            print(f"[mirror] ✅ Re-sent text to target")
+        else:
+            print(f"[mirror] ⚠️ Empty message after stripping links — skipped")
+    except Exception as e:
+        print(f"[mirror] ❌ mirror_copy failed: {e}")
+
+
 # --- Handlers ---
 
 @client.on(events.NewMessage(outgoing=True, chats="me"))
@@ -504,22 +550,15 @@ async def message_handler(event):
 
     # ── GROUP MIRROR ──────────────────────────────────────────────────────
     if not event.is_private:
-        # Simple GROUP_SOURCE → GROUP_TARGET mirror
-        if group_source_ids and group_target_entity:
-            if event.chat_id in group_source_ids:
-                try:
-                    await client.forward_messages(group_target_entity, event.message)
-                    print(f"[mirror] ✅ Forwarded from chat_id {event.chat_id} to target")
-                except Exception as e:
-                    print(f"[mirror] ❌ Failed: {e}")
+        # Determine target for this message
+        mirror_target = None
+        if group_source_ids and group_target_entity and event.chat_id in group_source_ids:
+            mirror_target = group_target_entity
+        elif event.chat_id in mirror_pairs:
+            mirror_target = mirror_pairs[event.chat_id]
 
-        # GROUP_MIRROR_PAIRS: @source>@target pairs
-        if event.chat_id in mirror_pairs:
-            try:
-                await client.forward_messages(mirror_pairs[event.chat_id], event.message)
-                print(f"[pairs] ✅ Forwarded from chat_id {event.chat_id}")
-            except Exception as e:
-                print(f"[pairs] ❌ Failed: {e}")
+        if mirror_target:
+            await mirror_copy(event.message, mirror_target)
 
         return
 
