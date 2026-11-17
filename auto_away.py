@@ -501,20 +501,25 @@ async def mirror_copy(message, target):
     - Re-sends media with cleaned caption
     - Text-only messages sent as plain text
     """
+    import tempfile
     try:
         raw_text = message.text or message.message or ""
         clean_text = _strip_links(raw_text)
 
         if message.media:
-            # Download and re-send media with cleaned caption
-            media = await client.download_media(message, file=bytes)
-            await client.send_file(
-                target,
-                file=media,
-                caption=clean_text or None,
-                force_document=False,
-            )
-            print(f"[mirror] ✅ Re-sent media to target")
+            # Download to a temp file and re-send
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = await client.download_media(message, file=tmpdir)
+                if path:
+                    await client.send_file(
+                        target,
+                        file=path,
+                        caption=clean_text or None,
+                        force_document=False,
+                    )
+                    print(f"[mirror] ✅ Re-sent media to target")
+                else:
+                    print(f"[mirror] ⚠️ Could not download media — skipped")
         elif clean_text:
             await client.send_message(target, clean_text)
             print(f"[mirror] ✅ Re-sent text to target")
