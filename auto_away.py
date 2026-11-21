@@ -47,7 +47,7 @@ import threading
 from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, events, utils, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 from telethon.tl.functions.account import UpdateStatusRequest
@@ -118,6 +118,13 @@ group_target_entity = None
 mirror_pairs = {}             # {source_chat_id: target_entity} from GROUP_MIRROR_PAIRS
 daily_stats = {}
 last_digest_date = None
+
+# About-me pages (set via Saved Messages: .set1 Title | Content)
+about_pages = {}              # {title: content} ordered dict of topic pages
+about_shown_to = {}           # {sender_id: title} — one topic per person
+
+# Album buffering: {grouped_id: (target, [messages], flush_task)}
+_album_buffer = {}
 
 # Bridge state: one download at a time so Gozilla replies can't get mixed up
 bridge_jobs = None  # created in main() once the event loop is running
@@ -480,31 +487,69 @@ async def resolve_mirror_pairs():
 
 # --- Mirror copy helper ---
 
-def _strip_links(text: str) -> str:
-    """Remove all URLs and t.me links from text."""
+def _strip_links(text: str, target_username: str = "") -> str:
+    """
+    Clean mirrored message text:
+    - Keep first #hashtag line (title)
+    - Remove all other #hashtag lines/words
+    - Remove entire line if it contains any URL
+    - Replace @username mentions with target channel username
+    """
     if not text:
         return text
-    # Remove URLs (http/https)
-    text = re.sub(r'https?://\S+', '', text)
-    # Remove bare t.me links
-    text = re.sub(r't\.me/\S+', '', text)
-    # Remove @username mentions that are links
-    # Clean up extra whitespace/newlines left behind
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+
+    lines = text.splitlines()
+    cleaned = []
+    first_hashtag_seen = False
+
+    for line in lines:
+        # Remove entire line if it contains a URL
+        if re.search(r'https?://\S+|t\.me/\S+|tiktok\.com/\S+', line):
+            continue
+
+        # Handle lines with hashtags
+        if '#' in line:
+            if not first_hashtag_seen:
+                # Keep the first hashtag line as-is (it's the title)
+                first_hashtag_seen = True
+                cleaned.append(line)
+            else:
+                # Remove hashtags from the line, keep other text
+                new_line = re.sub(r'#\S+', '', line).strip()
+                if new_line:
+                    cleaned.append(new_line)
+            continue
+
+        cleaned.append(line)
+
+    result = "\n".join(cleaned)
+
+    # Replace @username mentions with target username
+    if target_username:
+        tgt = target_username if target_username.startswith("@") else f"@{target_username}"
+        result = re.sub(r'@[\w]+', tgt, result)
+
+    # Clean up extra blank lines and spaces
+    result = re.sub(r' {2,}', ' ', result)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
 
 
 async def mirror_copy(message, target):
     """
     Re-send a message as our own (not forwarded).
-    - Strips all links from text/caption
+    - Keeps first #hashtag (title), removes rest
+    - Removes entire lines that contain URLs
+    - Replaces @mentions with target username
     - Re-sends media with cleaned caption
-    - Text-only messages sent as plain text
     """
     import tempfile
     try:
+        # Get target username for @mention replacement
+        target_username = getattr(target, 'username', '') or ''
+
         raw_text = message.text or message.message or ""
-        clean_text = _strip_links(raw_text)
+        clean_text = _strip_links(raw_text, target_username)
 
         if message.media:
             # Download to a temp file and re-send
@@ -524,7 +569,7 @@ async def mirror_copy(message, target):
             await client.send_message(target, clean_text)
             print(f"[mirror] ✅ Re-sent text to target")
         else:
-            print(f"[mirror] ⚠️ Empty message after stripping links — skipped")
+            print(f"[mirror] ⚠️ Empty message after stripping — skipped")
     except Exception as e:
         print(f"[mirror] ❌ mirror_copy failed: {e}")
 
@@ -533,20 +578,125 @@ async def mirror_copy(message, target):
 
 @client.on(events.NewMessage(outgoing=True, chats="me"))
 async def toggle_handler(event):
-    global is_away, already_replied_to
-    text = (event.raw_text or "").strip().lower()
+    global is_away, already_replied_to, about_pages
+    raw = (event.raw_text or "").strip()
+    text = raw.lower()
+
     if text == ".away":
         is_away = True
         already_replied_to.clear()
         await set_telegram_offline(True)
         await event.reply(f"✅ Away mode ON ({datetime.now().strftime('%H:%M')})")
         print("[state] Away mode enabled")
+
     elif text == ".back":
         is_away = False
         already_replied_to.clear()
         await set_telegram_offline(False)
         await event.reply(f"✅ Away mode OFF ({datetime.now().strftime('%H:%M')})")
         print("[state] Away mode disabled")
+
+    elif re.match(r'^\.set\d+\s+', raw, re.IGNORECASE):
+        # Format: .set1 Title | Content
+        # or:     .set2 Title (content on next lines after |)
+        body = re.sub(r'^\.set\d+\s+', '', raw, count=1, flags=re.IGNORECASE)
+        if '|' in body:
+            title_part, _, content_part = body.partition('|')
+            title = title_part.strip()
+            content = content_part.strip()
+        else:
+            title = body.strip()
+            content = ""
+        if title:
+            about_pages[title] = content
+            count = len(about_pages)
+            topics_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(about_pages.keys()))
+            await event.reply(
+                f"✅ Saved topic: *{title}*\n\n"
+                f"📋 All topics ({count}):\n{topics_list}\n\n"
+                f"To remove, use: .del {title}"
+            )
+            print(f"[about] Set topic '{title}' ({len(content)} chars)")
+
+    elif re.match(r'^\.del\s+', raw, re.IGNORECASE):
+        title = re.sub(r'^\.del\s+', '', raw, count=1, flags=re.IGNORECASE).strip()
+        if title in about_pages:
+            del about_pages[title]
+            await event.reply(f"🗑 Removed topic: *{title}*")
+            print(f"[about] Removed topic '{title}'")
+        else:
+            await event.reply(f"❓ Topic not found: {title}")
+
+    elif text == ".topics":
+        if about_pages:
+            lines = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(about_pages.keys()))
+            await event.reply(f"📋 Saved topics ({len(about_pages)}):\n{lines}")
+        else:
+            await event.reply("No topics set yet. Use: .set1 Title | Content")
+
+
+@client.on(events.CallbackQuery())
+async def callback_handler(event):
+    """Handle inline button presses for the about-me menu."""
+    global about_shown_to
+    data = event.data.decode("utf-8") if event.data else ""
+
+    if data.startswith("about_yes:"):
+        # Show topic menu buttons
+        try:
+            original_sender_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            original_sender_id = event.sender_id
+
+        if not about_pages:
+            await event.answer("No topics configured yet.")
+            return
+
+        # Build topic buttons
+        topic_buttons = []
+        for title in about_pages:
+            topic_buttons.append([Button.inline(title, data=f"topic:{original_sender_id}:{title}")])
+
+        await event.edit(
+            "ስለ ቻሌ ምን ማወቅ ይፈልጋሉ?\n\nከዚህ ውስጥ አንዱን ይምረጡ:",
+            buttons=topic_buttons
+        )
+        await event.answer()
+
+    elif data.startswith("about_no:"):
+        await event.edit("እሺ! ቻሌ ሲመለስ ይጠብቁ። 🙏")
+        await event.answer()
+
+    elif data.startswith("topic:"):
+        # topic:<original_sender_id>:<title>
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await event.answer("Error.")
+            return
+        try:
+            original_sender_id = int(parts[1])
+        except ValueError:
+            original_sender_id = event.sender_id
+        title = parts[2]
+
+        # One topic per person
+        if original_sender_id in about_shown_to:
+            already = about_shown_to[original_sender_id]
+            await event.answer(f"አስቀድሞ '{already}' አይተዋል።", alert=True)
+            return
+
+        content = about_pages.get(title, "")
+        if not content:
+            await event.answer("No content for this topic.", alert=True)
+            return
+
+        about_shown_to[original_sender_id] = title
+
+        # Send the topic content and close the menu
+        full_reply = f"📌 *{title}*\n\n{content}"
+        await event.edit(full_reply)
+        await event.answer()
+        print(f"[about] Showed topic '{title}' to sender {original_sender_id}")
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -563,7 +713,57 @@ async def message_handler(event):
             mirror_target = mirror_pairs[event.chat_id]
 
         if mirror_target:
-            await mirror_copy(event.message, mirror_target)
+            msg = event.message
+            gid = getattr(msg, 'grouped_id', None)
+            if gid:
+                # Album: buffer messages and flush together after short delay
+                if gid in _album_buffer:
+                    _album_buffer[gid][1].append(msg)
+                    # Reset flush timer
+                    _album_buffer[gid][2].cancel()
+                else:
+                    _album_buffer[gid] = [mirror_target, [msg], None]
+
+                async def flush_album(grouped_id=gid):
+                    await asyncio.sleep(1.5)
+                    entry = _album_buffer.pop(grouped_id, None)
+                    if not entry:
+                        return
+                    tgt, msgs, _ = entry
+                    # Sort by message id to preserve order
+                    msgs.sort(key=lambda m: m.id)
+                    # Send as album: collect media files first
+                    import tempfile
+                    try:
+                        target_username = getattr(tgt, 'username', '') or ''
+                        # Caption from last message that has text
+                        caption_msg = next((m for m in reversed(msgs) if m.text or m.message), msgs[-1])
+                        raw_text = caption_msg.text or caption_msg.message or ""
+                        clean_caption = _strip_links(raw_text, target_username)
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            files = []
+                            for m in msgs:
+                                if m.media:
+                                    p = await client.download_media(m, file=tmpdir)
+                                    if p:
+                                        files.append(p)
+                            if files:
+                                await client.send_file(
+                                    tgt,
+                                    file=files,
+                                    caption=clean_caption or None,
+                                    force_document=False,
+                                )
+                                print(f"[mirror] ✅ Sent album ({len(files)} files) to target")
+                            elif clean_caption:
+                                await client.send_message(tgt, clean_caption)
+                    except Exception as e:
+                        print(f"[mirror] ❌ Album flush failed: {e}")
+
+                task = asyncio.create_task(flush_album())
+                _album_buffer[gid][2] = task
+            else:
+                await mirror_copy(msg, mirror_target)
 
         return
 
@@ -640,9 +840,22 @@ async def message_handler(event):
     else:
         print(f"[auto-reply] Image not found ({AWAY_IMAGE_PATH}), skipping.")
 
-    await event.reply(build_away_message(sender))
     already_replied_to.add(sender_id)
-    print(f"[auto-reply] Sent image + away message to {name}")
+
+    # If about_pages are configured, offer the interactive about-me menu
+    if about_pages:
+        await client.send_message(
+            sender_id,
+            "ቻሌ አሁን ኦንላይን አይደለም።\n\nስለ ቻሌ ማወቅ ይፈልጋሉ?",
+            buttons=[
+                [Button.inline("አዎ ✅", data=f"about_yes:{sender_id}"),
+                 Button.inline("አይ ❌", data=f"about_no:{sender_id}")]
+            ]
+        )
+        print(f"[auto-reply] Sent away+about prompt to {name}")
+    else:
+        await event.reply(build_away_message(sender))
+        print(f"[auto-reply] Sent image + away message to {name}")
 
 
 # --- YouTube downloader bridge (runs on the same client as everything above) ---
