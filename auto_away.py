@@ -47,8 +47,7 @@ import threading
 from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, utils
-from telethon.tl.custom import Button
+from telethon import TelegramClient, events, utils, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 from telethon.tl.functions.account import UpdateStatusRequest
@@ -108,6 +107,8 @@ QUALITY = os.environ.get("QUALITY", "854p")
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "300"))
 BRIDGE_ENABLED = bool(YT_SCHEDULER_BOT)
 
+# --- About-me bot config ---
+ABOUT_BOT_TOKEN = os.environ.get("ABOUT_BOT_TOKEN", "").strip()
 
 # In-memory state
 is_away = False
@@ -133,6 +134,10 @@ bridge_jobs = None  # created in main() once the event loop is running
 bridge_current = {"job": None, "done": None, "clicked": set()}
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+# Secondary bot client — used ONLY for sending inline-button messages and
+# handling their CallbackQuery events (personal accounts cannot do this).
+bot_client = None  # initialized in main() if ABOUT_BOT_TOKEN is set
 
 
 # --- Session keepalive (prevents Telegram from expiring the session) ----------
@@ -637,52 +642,84 @@ async def toggle_handler(event):
             await event.reply("No topics set yet. Use: .set1 Title | Content")
 
 
-async def send_about_prompt(sender_id: int):
-    """Personal account sends yes/no inline buttons."""
-    await client.send_message(
-        sender_id,
-        "ቻሌ አሁን ኦንላይን አይደለም።\n\nስለ ቻሌ ማወቅ ይፈልጋሉ?",
-        buttons=[
-            [Button.inline("አዎ ✅", data=f"aw:{sender_id}"),
-             Button.inline("አይ ❌", data=f"ay:{sender_id}")]
-        ]
-    )
-    print(f"[about] Sent yes/no prompt to {sender_id}")
+about_bot_username = ""   # resolved at startup from bot_client
 
 
-async def send_topic_menu(sender_id: int, event=None):
-    """Personal account sends topic-selection inline buttons."""
-    topic_buttons = [
-        [Button.inline(title, data=f"tp:{sender_id}:{i}")]
-        for i, title in enumerate(about_pages.keys())
-    ]
-    text = "ስለ ቻሌ ምን ማወቅ ይፈልጋሉ?\n\nከዚህ ውስጥ አንዱን ይምረጡ:"
-    if event:
-        await event.edit(text, buttons=topic_buttons)
+async def user_send_about_prompt(sender_id: int):
+    """
+    Personal account sends the yes/no prompt.
+    - If bot is available: URL button → opens bot with deep link (works without prior /start)
+    - Fallback: plain text asking them to reply አዎ/አይ
+    """
+    if about_bot_username:
+        # URL button — personal accounts CAN send these
+        deep_link = f"https://t.me/{about_bot_username}?start=ab{sender_id}"
+        await client.send_message(
+            sender_id,
+            "ቻሌ አሁን ኦንላይን አይደለም።\n\nስለ ቻሌ ማወቅ ይፈልጋሉ?",
+            buttons=[
+                [Button.url("አዎ — ስለ ቻሌ ✅", url=deep_link)]
+            ]
+        )
+        print(f"[about] Sent URL-button prompt to {sender_id}")
     else:
-        await client.send_message(sender_id, text, buttons=topic_buttons)
-    print(f"[about] Sent topic menu to {sender_id}")
+        # No bot — plain away message
+        await client.send_message(
+            sender_id,
+            "ቻሌ አሁን ኦንላይን አይደለም።\n\nስለ ቻሌ ማወቅ ይፈልጋሉ?\n\n👉 አዎ ወይም አይ ብለው ይላኩ"
+        )
 
 
-@client.on(events.CallbackQuery())
-async def about_callback_handler(event):
-    """Handle inline button presses for the about-me menu."""
-    data = event.data.decode("utf-8") if event.data else ""
+async def bot_send_topic_menu(sender_id: int):
+    """Bot sends the topic-selection inline-button menu."""
+    if bot_client is None or not about_pages:
+        return
+    try:
+        topic_buttons = [
+            [Button.inline(title, data=f"tp:{sender_id}:{i}")]
+            for i, title in enumerate(about_pages.keys())
+        ]
+        await bot_client.send_message(
+            sender_id,
+            "ስለ ቻሌ ምን ማወቅ ይፈልጋሉ?\n\nከዚህ ውስጥ አንዱን ይምረጡ:",
+            buttons=topic_buttons
+        )
+        print(f"[about] Bot sent topic menu to {sender_id}")
+    except Exception as e:
+        print(f"[about] ❌ Bot failed to send topic menu: {e}")
 
-    if data.startswith("aw:"):
-        sender_id = int(data.split(":", 1)[1])
-        await event.answer()
-        if about_pages:
-            await send_topic_menu(sender_id, event=event)
-        else:
-            await event.edit("ቻሌ ሲመለስ ያነጋግሩ። 🙏", buttons=None)
 
-    elif data.startswith("ay:"):
+def register_bot_handlers():
+    """Register handlers on the bot client."""
+
+    @bot_client.on(events.NewMessage(pattern=r"^/start ab(\d+)$"))
+    async def on_start_deep(event):
+        """User opened bot via deep link — show topic menu immediately."""
+        sender_id = int(event.pattern_match.group(1))
+        if not about_pages:
+            await event.respond("ቻሌ ሲመለስ ያነጋግሩ። 🙏")
+            return
+        topic_buttons = [
+            [Button.inline(title, data=f"tp:{sender_id}:{i}")]
+            for i, title in enumerate(about_pages.keys())
+        ]
+        await event.respond(
+            "ስለ ቻሌ ምን ማወቅ ይፈልጋሉ?\n\nከዚህ ውስጥ አንዱን ይምረጡ:",
+            buttons=topic_buttons
+        )
+
+    @bot_client.on(events.NewMessage(pattern=r"^/start$"))
+    async def on_start_plain(event):
+        await event.respond("ሰላም! 👋 ይህ ስለ ቻሌ የሚነግርዎ AI ነው።")
+
+    @bot_client.on(events.CallbackQuery(pattern=b"^ay:"))
+    async def on_no(event):
         await event.answer()
         await event.edit("እሺ! ቻሌ ሲመለስ ይጠብቁ። 🙏", buttons=None)
 
-    elif data.startswith("tp:"):
-        parts = data.split(":", 2)
+    @bot_client.on(events.CallbackQuery(pattern=b"^tp:"))
+    async def on_topic(event):
+        parts = event.data.decode().split(":", 2)
         sender_id = int(parts[1])
         idx = int(parts[2])
         titles = list(about_pages.keys())
@@ -846,7 +883,7 @@ async def message_handler(event):
 
     # If about_pages exist, send the interactive about-me prompt
     if about_pages:
-        await send_about_prompt(sender_id)
+        await user_send_about_prompt(sender_id)
         print(f"[auto-reply] Sent about-prompt to {name}")
     else:
         await event.reply(build_away_message(sender))
@@ -1019,7 +1056,7 @@ def start_ping_server():
 # --- Main ---
 
 async def main():
-    global bridge_jobs
+    global bridge_jobs, bot_client
     threading.Thread(target=start_ping_server, daemon=True).start()
     print("Logging in...")
     await client.start()
@@ -1042,6 +1079,18 @@ async def main():
 
     asyncio.create_task(offline_keepalive_loop())
     asyncio.create_task(session_keepalive_loop())   # <-- prevents session expiry
+
+    # Start secondary bot client for inline buttons
+    if ABOUT_BOT_TOKEN:
+        global about_bot_username
+        bot_client = TelegramClient("about_bot", API_ID, API_HASH)
+        await bot_client.start(bot_token=ABOUT_BOT_TOKEN)
+        bot_me = await bot_client.get_me()
+        about_bot_username = bot_me.username or ""
+        register_bot_handlers()
+        print(f"[about] ✅ About-me bot @{about_bot_username} started")
+    else:
+        print("[about] ABOUT_BOT_TOKEN not set — about feature uses text fallback")
 
     if BRIDGE_ENABLED:
         bridge_jobs = asyncio.Queue()
